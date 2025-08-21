@@ -1,0 +1,84 @@
+This script is based on a dummy environment created in docker - it provides an example of how to use SQL commands to audit certain database settings
+
+-- =============================================================================
+-- CONSOLIDATED AUDIT SCRIPT
+-- This script performs all three audit steps in one run.
+-- 1. Checks logging status.
+-- 2. Lists who CAN access the secret table.
+-- 3. If pgaudit is enabled, lists who DID access the secret table.
+-- =============================================================================
+DO $$
+DECLARE
+    is_pgaudit_enabled BOOLEAN;
+    log_statement_setting TEXT;
+    record RECORD; -- Declaring the loop variable to fix the error
+BEGIN
+    -- Part 1: Check logging status and fetch historical access if available.
+    -- Create a temporary table to hold log results. This ensures the final SELECT always works.
+    CREATE TEMP TABLE IF NOT EXISTS access_log_results (
+        access_time TIMESTAMPTZ,
+        accessed_by TEXT,
+        query_run TEXT
+    );
+
+    -- Check if pgaudit is the primary logging method
+    SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pgaudit') INTO is_pgaudit_enabled;
+
+    IF is_pgaudit_enabled THEN
+        RAISE NOTICE 'SUCCESS: pgaudit is enabled. Querying for access events...';
+        -- NOTE: This assumes logs are in a table named 'audit_log'.
+        INSERT INTO access_log_results
+        SELECT
+            log_time,
+            user_name,
+            query_text
+        FROM
+            audit_log
+        WHERE
+            object_name = '<table_name>'
+            AND object_type = 'table'
+            AND query_text ILIKE 'SELECT%'
+        ORDER BY
+            log_time DESC;
+    ELSE
+        -- If pgaudit is not found, check for standard logging
+        SELECT current_setting('log_statement', true) INTO log_statement_setting;
+        IF log_statement_setting = 'all' THEN
+            RAISE WARNING 'PARTIAL LOGGING: Standard logging is enabled but cannot be queried with SQL.';
+            RAISE WARNING 'You must check the server''s text files manually.';
+        ELSE
+            RAISE WARNING 'LOGGING DISABLED: Cannot list access events because no required logging is enabled.';
+        END IF;
+    END IF;
+
+    -- Part 2: Report on who CAN currently access the table.
+    -- This part is now inside the DO block, but it cannot directly output a SELECT result.
+    -- We will raise notices for each privileged user instead.
+    RAISE NOTICE 'AUDIT 1: Listing all roles with current access permissions...';
+    FOR record IN
+        SELECT
+            r.rolname AS user_or_role_name,
+            CASE WHEN r.rolcanlogin THEN 'User Account' ELSE 'Group Role' END AS account_type,
+            CASE WHEN r.rolsuper THEN 'Access via Superuser' ELSE 'Access via SELECT Grant' END AS reason_for_access
+        FROM
+            pg_roles r
+        WHERE
+            r.rolsuper = true
+            OR has_table_privilege(r.rolname, 'public.<table_name>', 'SELECT')
+        ORDER BY
+            account_type DESC,
+            user_or_role_name
+    LOOP
+        RAISE NOTICE '  - % (%) - Reason: %', record.user_or_role_name, record.account_type, record.reason_for_access;
+    END LOOP;
+
+
+    -- Part 3: Report on who DID access the table.
+    -- This result set will be populated if pgaudit was found, otherwise it will be empty.
+    RAISE NOTICE 'AUDIT 2: Listing historical access events from pgaudit log...';
+    -- We will raise notices for each log entry.
+    FOR record IN SELECT * FROM access_log_results LOOP
+        RAISE NOTICE '  - At: %, By: %, Query: %', record.access_time, record.accessed_by, record.query_run;
+    END LOOP;
+
+END $$;
