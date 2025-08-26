@@ -1,0 +1,81 @@
+-- =============================================================================
+-- SCHEMA PERMISSION MATRIX SCRIPT (with USAGE checks)
+-- This script iterates through all tables in a specified schema and generates
+-- a matrix of permissions for every user and role. It now includes checks
+-- for USAGE on the schema and on any associated sequences.
+-- =============================================================================
+DO $$
+DECLARE
+    -- V V V  --  CONFIGURE YOUR SCHEMA NAME HERE  --  V V V
+    schema_to_audit TEXT := 'public';
+    -- ^ ^ ^  --  CONFIGURE YOUR SCHEMA NAME HERE  --  ^ ^ ^
+
+    tbl RECORD;
+    rol RECORD;
+    seq RECORD;
+    permission_matrix TEXT;
+    has_sequences BOOLEAN;
+BEGIN
+    RAISE NOTICE 'Starting permission audit for schema: %', schema_to_audit;
+    RAISE NOTICE '====================================================';
+    RAISE NOTICE '';
+
+    -- Part 1: Audit USAGE permission on the Schema itself
+    RAISE NOTICE 'SCHEMA USAGE PERMISSIONS (Prerequisite for any table access)';
+    RAISE NOTICE '----------------------------------------------------';
+    FOR rol IN SELECT rolname FROM pg_catalog.pg_roles ORDER BY rolname LOOP
+        IF has_schema_privilege(rol.rolname, schema_to_audit, 'USAGE') THEN
+            RAISE NOTICE '- Role/User "%" has USAGE permission.', rol.rolname;
+        END IF;
+    END LOOP;
+    RAISE NOTICE '----------------------------------------------------';
+
+
+    -- Part 2: Audit permissions for each table in the schema
+    FOR tbl IN
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = schema_to_audit
+        ORDER BY table_name
+    LOOP
+        RAISE NOTICE '';
+        RAISE NOTICE 'TABLE: %', tbl.table_name;
+        RAISE NOTICE '----------------------------------------------------';
+        RAISE NOTICE 'ROLE / USER                | S | I | U | D |';
+        RAISE NOTICE '---------------------------+---+---+---+---+';
+
+        -- For each table, loop through every role and user in the database
+        FOR rol IN SELECT rolname FROM pg_catalog.pg_roles ORDER BY rolname LOOP
+            IF has_any_column_privilege(rol.rolname, schema_to_audit || '.' || tbl.table_name, 'SELECT, INSERT, UPDATE, DELETE') THEN
+                permission_matrix := '';
+                IF has_table_privilege(rol.rolname, schema_to_audit || '.' || tbl.table_name, 'SELECT') THEN permission_matrix := permission_matrix || ' X |'; ELSE permission_matrix := permission_matrix || '   |'; END IF;
+                IF has_table_privilege(rol.rolname, schema_to_audit || '.' || tbl.table_name, 'INSERT') THEN permission_matrix := permission_matrix || ' X |'; ELSE permission_matrix := permission_matrix || '   |'; END IF;
+                IF has_table_privilege(rol.rolname, schema_to_audit || '.' || tbl.table_name, 'UPDATE') THEN permission_matrix := permission_matrix || ' X |'; ELSE permission_matrix := permission_matrix || '   |'; END IF;
+                IF has_table_privilege(rol.rolname, schema_to_audit || '.' || tbl.table_name, 'DELETE') THEN permission_matrix := permission_matrix || ' X |'; ELSE permission_matrix := permission_matrix || '   |'; END IF;
+                RAISE NOTICE '% |%', rpad(rol.rolname, 26), permission_matrix;
+            END IF;
+        END LOOP;
+
+        -- Part 3: Check for associated sequences and their USAGE permissions
+        has_sequences := false;
+        FOR seq IN
+            SELECT pg_get_serial_sequence(quote_ident(schema_to_audit) || '.' || quote_ident(tbl.table_name), attname) AS sequence_name
+            FROM pg_attribute
+            WHERE attrelid = (quote_ident(schema_to_audit) || '.' || quote_ident(tbl.table_name))::regclass
+              AND attnum > 0 AND NOT attisdropped
+              AND pg_get_serial_sequence(quote_ident(schema_to_audit) || '.' || quote_ident(tbl.table_name), attname) IS NOT NULL
+        LOOP
+            IF NOT has_sequences THEN
+                RAISE NOTICE '  -> Associated Sequence Permissions (Required for INSERT with auto-ID):';
+                has_sequences := true;
+            END IF;
+            RAISE NOTICE '     Sequence: %', seq.sequence_name;
+            FOR rol IN SELECT rolname FROM pg_catalog.pg_roles WHERE has_sequence_privilege(rolname, seq.sequence_name, 'USAGE') ORDER BY rolname LOOP
+                RAISE NOTICE '       - Role/User "%" has USAGE permission.', rol.rolname;
+            END LOOP;
+        END LOOP;
+
+    END LOOP;
+    RAISE NOTICE '';
+    RAISE NOTICE 'Audit complete.';
+END $$;
