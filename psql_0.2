@@ -46,7 +46,8 @@ BEGIN
 
         -- For each table, loop through every role and user in the database
         FOR rol IN SELECT rolname FROM pg_catalog.pg_roles ORDER BY rolname LOOP
-            IF has_any_column_privilege(rol.rolname, schema_to_audit || '.' || tbl.table_name, 'SELECT, INSERT, UPDATE, DELETE') THEN
+            -- Corrected line: Check for any privilege. DELETE is not a column-level privilege.
+            IF has_table_privilege(rol.rolname, schema_to_audit || '.' || tbl.table_name, 'SELECT, INSERT, UPDATE, DELETE') THEN
                 permission_matrix := '';
                 IF has_table_privilege(rol.rolname, schema_to_audit || '.' || tbl.table_name, 'SELECT') THEN permission_matrix := permission_matrix || ' X |'; ELSE permission_matrix := permission_matrix || '   |'; END IF;
                 IF has_table_privilege(rol.rolname, schema_to_audit || '.' || tbl.table_name, 'INSERT') THEN permission_matrix := permission_matrix || ' X |'; ELSE permission_matrix := permission_matrix || '   |'; END IF;
