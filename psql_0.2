@@ -1,8 +1,8 @@
 -- =============================================================================
--- SCHEMA PERMISSION MATRIX SCRIPT (v3 - Full CRUD with Login Status)
--- This script checks for full CRUD (Create, Read, Update, Delete) access.
--- It checks for USAGE on the schema, SIUD on each table, and now
--- explicitly states whether a role has LOGIN permission.
+-- SCHEMA PERMISSION MATRIX SCRIPT (v5 - Effective Permissions Only)
+-- This script now only shows users/roles in the table matrix if they have
+-- the prerequisite USAGE permission on the schema, providing a true
+-- picture of effective permissions.
 -- =============================================================================
 DO $$
 DECLARE
@@ -10,27 +10,18 @@ DECLARE
     schema_to_audit TEXT := 'public';
     -- ^ ^ ^  --  CONFIGURE YOUR SCHEMA NAME HERE  --  ^ ^ ^
 
+    -- Declare record variables to hold the current row during loops.
     tbl RECORD;
     rol RECORD;
     permission_matrix TEXT;
 BEGIN
-    RAISE NOTICE 'Starting full permission audit for schema: %', schema_to_audit;
+    RAISE NOTICE 'Starting effective permission audit for schema: %', schema_to_audit;
     RAISE NOTICE '====================================================';
-    RAISE NOTICE '';
 
-    -- Part 1: Audit USAGE permission on the Schema itself
-    RAISE NOTICE 'SCHEMA USAGE PERMISSIONS (Prerequisite for any table access)';
-    RAISE NOTICE '----------------------------------------------------';
-    FOR rol IN SELECT rolname FROM pg_catalog.pg_roles ORDER BY rolname LOOP
-        IF has_schema_privilege(rol.rolname, schema_to_audit, 'USAGE') THEN
-            RAISE NOTICE '- Role/User "%" has USAGE permission.', rol.rolname;
-        END IF;
-    END LOOP;
-    RAISE NOTICE '----------------------------------------------------';
-
-
-    -- Part 2: Audit SELECT, INSERT, UPDATE, DELETE permissions for each table
+    -- Part 1: Audit permissions for each table in the schema
     FOR tbl IN
+        -- We query information_schema.tables as it's the standard, portable
+        -- way to get a list of tables within a specific schema.
         SELECT table_name
         FROM information_schema.tables
         WHERE table_schema = schema_to_audit
@@ -38,35 +29,52 @@ BEGIN
     LOOP
         RAISE NOTICE '';
         RAISE NOTICE 'TABLE: %', tbl.table_name;
-        RAISE NOTICE '-------------------------------------------------------------------------';
-        RAISE NOTICE 'ROLE / USER                | LOGIN? | S | I | U | D |';
-        RAISE NOTICE '---------------------------+--------+---+---+---+---|';
+        RAISE NOTICE '-----------------------------------------------------------------------------------------------------------------';
+        RAISE NOTICE 'ROLE / USER                | LOGIN? | INHERITED FROM               | S | I | U | D |';
+        RAISE NOTICE '---------------------------+--------+------------------------------+---+---+---+---|';
 
         -- For each table, loop through every role and user in the database
         FOR rol IN
-            SELECT rolname, rolcanlogin
-            FROM pg_catalog.pg_roles
-            ORDER BY rolname
+            SELECT
+                r.rolname,
+                r.rolcanlogin,
+                -- This subquery constructs the "Inherited From" list.
+                COALESCE(
+                    (SELECT string_agg(parent.rolname, ', ')
+                     FROM pg_auth_members am
+                     JOIN pg_roles parent ON am.roleid = parent.oid
+                     WHERE am.member = r.oid),
+                    ''
+                ) AS inherited_roles
+            FROM pg_catalog.pg_roles r
+            ORDER BY r.rolname
         LOOP
-            -- Check if the role has any of the main privileges on the table
-            IF has_table_privilege(rol.rolname, schema_to_audit || '.' || tbl.table_name, 'SELECT, INSERT, UPDATE, DELETE') THEN
+            -- This is the core logic change. The report now only includes a role if it has
+            -- BOTH the prerequisite USAGE on the schema AND at least one S/I/U/D permission
+            -- on the table itself. This ensures we only report on effective permissions.
+            IF has_schema_privilege(rol.rolname, schema_to_audit, 'USAGE') AND
+               has_table_privilege(rol.rolname, schema_to_audit || '.' || tbl.table_name, 'SELECT, INSERT, UPDATE, DELETE') THEN
+
                 permission_matrix := '';
-                -- Check for SELECT
+
+                -- We use has_table_privilege() for each check because it automatically
+                -- resolves the full inheritance chain.
                 IF has_table_privilege(rol.rolname, schema_to_audit || '.' || tbl.table_name, 'SELECT') THEN permission_matrix := permission_matrix || ' X |'; ELSE permission_matrix := permission_matrix || '   |'; END IF;
-                -- Check for INSERT
                 IF has_table_privilege(rol.rolname, schema_to_audit || '.' || tbl.table_name, 'INSERT') THEN permission_matrix := permission_matrix || ' X |'; ELSE permission_matrix := permission_matrix || '   |'; END IF;
-                -- Check for UPDATE
                 IF has_table_privilege(rol.rolname, schema_to_audit || '.' || tbl.table_name, 'UPDATE') THEN permission_matrix := permission_matrix || ' X |'; ELSE permission_matrix := permission_matrix || '   |'; END IF;
-                -- Check for DELETE
                 IF has_table_privilege(rol.rolname, schema_to_audit || '.' || tbl.table_name, 'DELETE') THEN permission_matrix := permission_matrix || ' X |'; ELSE permission_matrix := permission_matrix || '   |'; END IF;
 
-                RAISE NOTICE '% | % |%',
+                RAISE NOTICE '% | % | % |%',
                     rpad(rol.rolname, 26),
                     CASE WHEN rol.rolcanlogin THEN ' Yes  ' ELSE ' No   ' END,
+                    rpad(rol.inherited_roles, 28),
                     permission_matrix;
             END IF;
         END LOOP;
     END LOOP;
     RAISE NOTICE '';
-    RAISE NOTICE 'Full permission audit complete.';
+    -- Updated final line for accuracy and to avoid false assurance.
+    RAISE NOTICE 'Effective permission report for schema ''%'' complete.', schema_to_audit;
 END $$;
+
+
