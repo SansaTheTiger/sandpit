@@ -1,7 +1,7 @@
 ' =============================================================================
-' VBA MACRO TO IMPORT AND PROCESS POSTGRESQL AUDIT DATA (v3 - ROBUST PARSING)
-' This version is more resilient and will strip out any double quotes ("")
-' found in the input file, which is a common issue with GUI exports.
+' VBA MACRO TO IMPORT AND PROCESS POSTGRESQL AUDIT DATA (v4 - WHITESPACE TRIM)
+' This version adds trimming of whitespace from all data points to handle
+' subtle formatting issues from GUI exports.
 ' To install:
 ' 1. In Excel, press ALT + F11 to open the VBA Editor.
 ' 2. Go to Insert > Module.
@@ -46,10 +46,16 @@ Sub ProcessAuditReport()
     Do While Not EOF(fileNum)
         Line Input #fileNum, lineFromFile
         
-        ' *** KEY CHANGE IS HERE: Strip all double quotes from the line before splitting ***
+        ' First, strip all double quotes from the line
         lineFromFile = Replace(lineFromFile, """", "")
         
         data = Split(lineFromFile, "|")
+        
+        ' *** NEW CHANGE: Trim whitespace from every element in the array ***
+        Dim k As Long
+        For k = LBound(data) To UBound(data)
+            data(k) = Trim(data(k))
+        Next k
         
         If UBound(data) >= 1 Then
             Dim dataType As String
@@ -57,7 +63,7 @@ Sub ProcessAuditReport()
             
             Select Case True
                 Case dataType = "ROLE_METADATA"
-                    If Not roleMetadata.Exists(data(1)) Then
+                    If UBound(data) >= 6 And Not roleMetadata.Exists(data(1)) Then
                         Dim meta As Object
                         Set meta = CreateObject("Scripting.Dictionary")
                         meta("can_login") = IIf(LCase(data(2)) = "t", "Yes", "No")
@@ -71,25 +77,27 @@ Sub ProcessAuditReport()
                     End If
                 
                 Case dataType = "PRIVILEGE"
-                    Dim grantee As String, objType As String, objName As String, priv As String
-                    grantee = data(1)
-                    objType = data(2)
-                    objName = data(3)
-                    priv = data(4)
-                    
-                    Dim fullObjName As String
-                    fullObjName = objType & ": " & objName
-                    
-                    allObjects(fullObjName) = 1
-                    allRoles(grantee) = 1
-                    
-                    If Not permissions.Exists(fullObjName) Then
-                        Set permissions(fullObjName) = CreateObject("Scripting.Dictionary")
+                    If UBound(data) >= 4 Then
+                        Dim grantee As String, objType As String, objName As String, priv As String
+                        grantee = data(1)
+                        objType = data(2)
+                        objName = data(3)
+                        priv = data(4)
+                        
+                        Dim fullObjName As String
+                        fullObjName = objType & ": " & objName
+                        
+                        allObjects(fullObjName) = 1
+                        allRoles(grantee) = 1
+                        
+                        If Not permissions.Exists(fullObjName) Then
+                            Set permissions(fullObjName) = CreateObject("Scripting.Dictionary")
+                        End If
+                        If Not permissions(fullObjName).Exists(grantee) Then
+                            Set permissions(fullObjName)(grantee) = CreateObject("Scripting.Dictionary")
+                        End If
+                        permissions(fullObjName)(grantee)(priv) = "X"
                     End If
-                    If Not permissions(fullObjName).Exists(grantee) Then
-                        Set permissions(fullObjName)(grantee) = CreateObject("Scripting.Dictionary")
-                    End If
-                    permissions(fullObjName)(grantee)(priv) = "X"
 
                 Case InStr(dataType, "_CHECK") > 0 Or InStr(dataType, "_VULN") > 0
                     finalChecks(dataType) = data(1)
@@ -111,9 +119,9 @@ Sub ProcessAuditReport()
     
     ' --- Write the report ---
     If allRoles.Count = 0 Then
-        matrixSheet.Cells(1, 1).Value = "Error: No data could be parsed from the input file. Please verify the file format and delimiter."
+        matrixSheet.Cells(1, 1).Value = "Error: No user or permission data could be parsed. Please verify the input file format and content."
         Application.ScreenUpdating = True
-        MsgBox "Could not parse any data from the selected file. Please check the file's content and format.", vbCritical
+        MsgBox "Could not parse any user or permission data from the selected file. Please check the file's content and format.", vbCritical
         Exit Sub
     End If
     
