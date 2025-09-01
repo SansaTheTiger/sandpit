@@ -1,208 +1,83 @@
 -- =============================================================================
--- SCHEMA PERMISSION MATRIX SCRIPT (v11 - Added High-Risk Admin Privileges)
--- This version expands Part 0 to audit for critical security attributes like
--- BYPASSRLS (can bypass Row-Level Security) and REPLICATION (can copy the DB).
+-- RAW PERMISSIONS EXTRACTOR SCRIPT (v3 - Enhanced Schema Vulnerability Check)
+-- Purpose: To extract all relevant permission data in a simple, raw format
+-- suitable for processing by an external tool (e.g., Python, Excel VBA).
+-- Output is a series of pipe-delimited lines.
 -- =============================================================================
-DO $$
-DECLARE
-    -- V V V  --  CONFIGURE YOUR SCHEMA NAME HERE  --  V V V
-    schema_to_audit TEXT := 'public';
-    -- ^ ^ ^  --  CONFIGURE YOUR SCHEMA NAME HERE  --  ^ ^ ^
 
-    tbl RECORD;
-    output_row RECORD;
-    permission_matrix TEXT;
-BEGIN
-    RAISE NOTICE 'Starting permission source audit for schema: %', schema_to_audit;
-    RAISE NOTICE '=================================================================================================================';
+-- Suppress informational messages and remove borders for clean output
+\t on
+\pset format unaligned
+\pset recordsep '\n'
+\pset fieldsep '|'
 
-    -- =============================================================================
-    -- PART 0: GLOBAL ADMINISTRATIVE PRIVILEGES
-    -- These privileges are cluster-wide and represent the highest level of access.
-    -- SUPERUSER: Bypasses all permission checks. Can alter any setting.
-    -- CREATEROLE: Can create/alter/drop roles, which can lead to privilege escalation.
-    -- BYPASSRLS: Can ignore all Row-Level Security policies, exposing all data.
-    -- REPLICATION: Can initiate streaming replication, allowing bulk data exfiltration.
-    -- =============================================================================
-    RAISE NOTICE '';
-    RAISE NOTICE 'GLOBAL ADMINISTRATIVE PRIVILEGES (Cluster-Wide)';
-    RAISE NOTICE '--------------------------------------------------------------------------------';
-    RAISE NOTICE 'ROLE / USER                | SUPERUSER? | CREATEROLE? | BYPASSRLS? | REPLICATION? |';
-    RAISE NOTICE '---------------------------+------------+-------------+------------+--------------|';
+-- PART 0: Role Metadata (Attributes and Memberships)
+-- This section outputs the fundamental properties of each role.
+SELECT
+    'ROLE_METADATA' AS "type",
+    r.rolname AS "role_name",
+    r.rolcanlogin AS "can_login",
+    r.rolsuper AS "is_superuser",
+    r.rolcreaterole AS "can_create_role",
+    r.rolbypassrls AS "can_bypass_rls",
+    r.rolreplication AS "can_replicate",
+    (SELECT string_agg(parent.rolname, ',') FROM pg_auth_members am JOIN pg_roles parent ON am.roleid = parent.oid WHERE am.member = r.oid) AS "member_of"
+FROM pg_roles r;
 
-    FOR output_row IN
-        SELECT
-            rolname,
-            rolsuper AS is_superuser,
-            rolcreaterole AS can_create_role,
-            rolbypassrls AS can_bypass_rls,
-            rolreplication AS can_replicate
-        FROM pg_catalog.pg_roles
-        WHERE rolsuper = true OR rolcreaterole = true OR rolbypassrls = true OR rolreplication = true
-        ORDER BY rolname
-    LOOP
-        permission_matrix := '';
-        IF output_row.is_superuser THEN permission_matrix := permission_matrix || '     X      |'; ELSE permission_matrix := permission_matrix || '            |'; END IF;
-        IF output_row.can_create_role THEN permission_matrix := permission_matrix || '      X      |'; ELSE permission_matrix := permission_matrix || '             |'; END IF;
-        IF output_row.can_bypass_rls THEN permission_matrix := permission_matrix || '     X      |'; ELSE permission_matrix := permission_matrix || '            |'; END IF;
-        IF output_row.can_replicate THEN permission_matrix := permission_matrix || '       X      |'; ELSE permission_matrix := permission_matrix || '              |'; END IF;
-        RAISE NOTICE '% |%', rpad(output_row.rolname, 26), permission_matrix;
-    END LOOP;
+-- PART 1 & 2: Database and Schema Privileges
+-- This uses a recursive query to find all effective permissions, tracing them
+-- back to their direct source grant.
+WITH RECURSIVE effective_privs AS (
+    -- Base case: Direct grants on DBs and Schemas
+    SELECT 'DATABASE' AS object_type, d.datname AS object_name, acl.privilege_type, r.rolname AS grantee_name, r.rolname AS source_role, r.oid AS grantee_oid
+    FROM pg_database d, LATERAL aclexplode(d.datacl) AS acl JOIN pg_roles r ON acl.grantee = r.oid WHERE d.datname = current_database()
+    UNION ALL
+    SELECT 'SCHEMA' AS object_type, n.nspname AS object_name, acl.privilege_type, r.rolname AS grantee_name, r.rolname AS source_role, r.oid AS grantee_oid
+    FROM pg_namespace n, LATERAL aclexplode(n.nspacl) AS acl JOIN pg_roles r ON acl.grantee = r.oid
+    UNION ALL
+    -- Recursive step: Inherited grants
+    SELECT ep.object_type, ep.object_name, ep.privilege_type, m_r.rolname AS grantee_name, ep.source_role, m_r.oid AS grantee_oid
+    FROM pg_auth_members m JOIN effective_privs ep ON m.roleid = ep.grantee_oid JOIN pg_roles m_r ON m.member = m_r.oid
+)
+SELECT 'PRIVILEGE' AS "type", grantee_name, object_type, object_name, privilege_type, source_role
+FROM effective_privs;
 
 
-    -- =============================================================================
-    -- PART 1: DATABASE-LEVEL PRIVILEGES
-    -- =============================================================================
-    RAISE NOTICE '';
-    RAISE NOTICE 'DATABASE-LEVEL PRIVILEGES for database ''%''', current_database();
-    RAISE NOTICE '-----------------------------------------------------------------------------------------------------------------';
-    RAISE NOTICE 'ROLE / USER                | LOGIN? | PERMISSION SOURCE            | CONNECT | CREATE  | TEMPORARY |';
-    RAISE NOTICE '---------------------------+--------+------------------------------+---------+---------+-----------|';
-
-    FOR output_row IN
-        WITH RECURSIVE effective_privs AS (
-            -- Base case: Roles with direct grants on the current database
-            SELECT acl.grantee AS role_oid, r.rolname, r.rolname AS direct_source_role, acl.privilege_type
-            FROM pg_database d
-            CROSS JOIN LATERAL aclexplode(d.datacl) AS acl
-            JOIN pg_roles r ON acl.grantee = r.oid
-            WHERE d.datname = current_database()
-            UNION ALL
-            -- Recursive step: Roles that are members of the roles found above
-            SELECT m.member, sub_r.rolname, ep.direct_source_role, ep.privilege_type
-            FROM pg_auth_members m
-            JOIN pg_roles sub_r ON m.member = sub_r.oid
-            JOIN effective_privs ep ON m.roleid = ep.role_oid
-        )
-        SELECT
-            ep.rolname,
-            r.rolcanlogin,
-            CASE WHEN ep.rolname = ep.direct_source_role THEN '**directly assigned**' ELSE ep.direct_source_role END AS permission_source,
-            string_agg(DISTINCT ep.privilege_type, ',') AS privileges
-        FROM effective_privs ep
-        JOIN pg_roles r ON ep.rolname = r.rolname
-        GROUP BY ep.rolname, r.rolcanlogin, ep.direct_source_role
-        ORDER BY ep.rolname, permission_source
-    LOOP
-        permission_matrix := '';
-        IF 'CONNECT' = ANY(string_to_array(output_row.privileges, ',')) THEN permission_matrix := permission_matrix || '    X    |'; ELSE permission_matrix := permission_matrix || '         |'; END IF;
-        IF 'CREATE' = ANY(string_to_array(output_row.privileges, ',')) THEN permission_matrix := permission_matrix || '    X    |'; ELSE permission_matrix := permission_matrix || '         |'; END IF;
-        IF 'TEMPORARY' = ANY(string_to_array(output_row.privileges, ',')) THEN permission_matrix := permission_matrix || '     X     |'; ELSE permission_matrix := permission_matrix || '           |'; END IF;
-        RAISE NOTICE '% | % | % |%', rpad(output_row.rolname, 26), CASE WHEN output_row.rolcanlogin THEN ' Yes  ' ELSE ' No   ' END, rpad(output_row.permission_source, 28), permission_matrix;
-    END LOOP;
+-- PART 3: Table-Level Privileges
+-- Similar recursive query, but for every table in every user schema.
+WITH RECURSIVE effective_privs AS (
+    -- Base case: Direct grants on tables
+    SELECT c.relname AS object_name, n.nspname as schema_name, acl.privilege_type, r.rolname AS grantee_name, r.rolname AS source_role, r.oid AS grantee_oid
+    FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid,
+    LATERAL aclexplode(COALESCE(c.relacl, acldefault('r', c.relowner))) AS acl
+    JOIN pg_roles r ON acl.grantee = r.oid
+    WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'v', 'm')
+    UNION ALL
+    -- Recursive step: Inherited grants
+    SELECT ep.object_name, ep.schema_name, ep.privilege_type, m_r.rolname AS grantee_name, ep.source_role, m_r.oid AS grantee_oid
+    FROM pg_auth_members m JOIN effective_privs ep ON m.roleid = ep.grantee_oid JOIN pg_roles m_r ON m.member = m_r.oid
+)
+SELECT 'PRIVILEGE' AS "type", grantee_name, 'TABLE' as object_type, schema_name || '.' || object_name, privilege_type, source_role
+FROM effective_privs;
 
 
-    -- =============================================================================
-    -- PART 2: SCHEMA-LEVEL PRIVILEGES
-    -- =============================================================================
-    RAISE NOTICE '';
-    RAISE NOTICE 'SCHEMA-LEVEL PRIVILEGES for schema ''%''', schema_to_audit;
-    RAISE NOTICE '-----------------------------------------------------------------------------------------------------------------';
-    RAISE NOTICE 'ROLE / USER                | LOGIN? | PERMISSION SOURCE            | CREATE  | USAGE   |';
-    RAISE NOTICE '---------------------------+--------+------------------------------+---------+---------|';
+-- =============================================================================
+-- FINAL AUDIT CHECKS
+-- These checks provide high-level context about the security posture.
+-- =============================================================================
 
-    FOR output_row IN
-        WITH RECURSIVE effective_privs AS (
-            -- Base case: Roles with direct grants on the schema
-            SELECT acl.grantee AS role_oid, r.rolname, r.rolname AS direct_source_role, acl.privilege_type
-            FROM pg_namespace n
-            CROSS JOIN LATERAL aclexplode(n.nspacl) AS acl
-            JOIN pg_roles r ON acl.grantee = r.oid
-            WHERE n.nspname = schema_to_audit
-            UNION ALL
-            -- Recursive step: Roles that are members of the roles found above
-            SELECT m.member, sub_r.rolname, ep.direct_source_role, ep.privilege_type
-            FROM pg_auth_members m
-            JOIN pg_roles sub_r ON m.member = sub_r.oid
-            JOIN effective_privs ep ON m.roleid = ep.role_oid
-        )
-        SELECT
-            ep.rolname,
-            r.rolcanlogin,
-            CASE WHEN ep.rolname = ep.direct_source_role THEN '**directly assigned**' ELSE ep.direct_source_role END AS permission_source,
-            string_agg(DISTINCT ep.privilege_type, ',') AS privileges
-        FROM effective_privs ep
-        JOIN pg_roles r ON ep.rolname = r.rolname
-        GROUP BY ep.rolname, r.rolcanlogin, ep.direct_source_role
-        ORDER BY ep.rolname, permission_source
-    LOOP
-        permission_matrix := '';
-        IF 'CREATE' = ANY(string_to_array(output_row.privileges, ',')) THEN permission_matrix := permission_matrix || '    X    |'; ELSE permission_matrix := permission_matrix || '         |'; END IF;
-        IF 'USAGE' = ANY(string_to_array(output_row.privileges, ',')) THEN permission_matrix := permission_matrix || '    X    |'; ELSE permission_matrix := permission_matrix || '         |'; END IF;
-        RAISE NOTICE '% | % | % |%', rpad(output_row.rolname, 26), CASE WHEN output_row.rolcanlogin THEN ' Yes  ' ELSE ' No   ' END, rpad(output_row.permission_source, 28), permission_matrix;
-    END LOOP;
+-- RLS Check: Is Row-Level Security used anywhere in this database?
+SELECT 'RLS_CHECK' AS "type", EXISTS(SELECT 1 FROM pg_class WHERE relrowsecurity = true) as "rls_is_enabled";
 
+-- Default Privileges Check: Are there any default privileges set?
+SELECT 'DEFAULT_PRIVS_CHECK' AS "type", EXISTS(SELECT 1 FROM pg_default_acl) as "default_privs_exist";
 
-    -- =============================================================================
-    -- PART 3: TABLE-LEVEL PRIVILEGES
-    -- =============================================================================
-    FOR tbl IN
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema = schema_to_audit
-        ORDER BY table_name
-    LOOP
-        RAISE NOTICE '';
-        RAISE NOTICE 'TABLE: %', tbl.table_name;
-        RAISE NOTICE '-----------------------------------------------------------------------------------------------------------------';
-        RAISE NOTICE 'ROLE / USER                | LOGIN? | PERMISSION SOURCE            | S | I | U | D |';
-        RAISE NOTICE '---------------------------+--------+------------------------------+---+---+---+---|';
+-- Public Create Vulnerability Check: Lists all schemas where the PUBLIC role can create objects.
+SELECT 'PUBLIC_CREATE_VULN_SCHEMAS' AS "type", string_agg(nspname, ',') FROM pg_namespace WHERE has_schema_privilege('public', nspname, 'CREATE') AND nspname NOT LIKE 'pg_%' AND nspname <> 'information_schema';
 
-        FOR output_row IN
-            WITH RECURSIVE effective_privs AS (
-                -- 1. Base Case: Find roles with DIRECT permissions on the table.
-                SELECT
-                    acl.grantee AS role_oid,
-                    r.rolname AS role_name,
-                    r.rolname AS direct_source_role,
-                    acl.privilege_type AS privilege
-                FROM pg_catalog.pg_class c
-                JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
-                CROSS JOIN LATERAL aclexplode(COALESCE(c.relacl, acldefault('r', c.relowner))) AS acl
-                JOIN pg_catalog.pg_roles r ON acl.grantee = r.oid
-                WHERE n.nspname = schema_to_audit AND c.relname = tbl.table_name
+-- Passwordless Login Check: Are there any roles that can log in but have no password set?
+SELECT 'NULL_PASS_CHECK' AS "type", EXISTS(SELECT 1 FROM pg_roles WHERE rolcanlogin = true AND rolpassword IS NULL) as "passwordless_login_exists";
 
-                UNION ALL
-
-                -- 2. Recursive Step: Find users/roles that are members of the roles found above.
-                SELECT
-                    m.member AS role_oid,
-                    sub_r.rolname AS role_name,
-                    ep.direct_source_role,
-                    ep.privilege
-                FROM pg_auth_members m
-                JOIN pg_roles sub_r ON m.member = sub_r.oid
-                JOIN effective_privs ep ON m.roleid = ep.role_oid
-            )
-            -- 3. Final Aggregation: Group the results to create the matrix.
-            SELECT
-                ep.role_name,
-                r.rolcanlogin,
-                CASE
-                    WHEN ep.role_name = ep.direct_source_role THEN '**directly assigned**'
-                    ELSE ep.direct_source_role
-                END AS permission_source,
-                string_agg(DISTINCT ep.privilege, ',') AS privileges
-            FROM effective_privs ep
-            JOIN pg_roles r ON ep.role_name = r.rolname
-            WHERE has_schema_privilege(ep.role_name, schema_to_audit, 'USAGE')
-            GROUP BY ep.role_name, r.rolcanlogin, ep.direct_source_role
-            ORDER BY ep.role_name, permission_source
-        LOOP
-            permission_matrix := '';
-            IF 'SELECT' = ANY(string_to_array(output_row.privileges, ',')) THEN permission_matrix := permission_matrix || ' X |'; ELSE permission_matrix := permission_matrix || '   |'; END IF;
-            IF 'INSERT' = ANY(string_to_array(output_row.privileges, ',')) THEN permission_matrix := permission_matrix || ' X |'; ELSE permission_matrix := permission_matrix || '   |'; END IF;
-            IF 'UPDATE' = ANY(string_to_array(output_row.privileges, ',')) THEN permission_matrix := permission_matrix || ' X |'; ELSE permission_matrix := permission_matrix || '   |'; END IF;
-            IF 'DELETE' = ANY(string_to_array(output_row.privileges, ',')) THEN permission_matrix := permission_matrix || ' X |'; ELSE permission_matrix := permission_matrix || '   |'; END IF;
-
-            RAISE NOTICE '% | % | % |%',
-                rpad(output_row.role_name, 26),
-                CASE WHEN output_row.rolcanlogin THEN ' Yes  ' ELSE ' No   ' END,
-                rpad(output_row.permission_source, 28),
-                permission_matrix;
-        END LOOP;
-    END LOOP;
-    RAISE NOTICE '';
-    RAISE NOTICE 'Effective permission report for schema ''%'' complete.', schema_to_audit;
-END $$;
+-- pgcrypto Extension Check: Is the standard encryption extension available?
+SELECT 'PGCRYPTO_CHECK' AS "type", EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pgcrypto') as "pgcrypto_is_installed";
 
