@@ -1,83 +1,72 @@
 -- =============================================================================
--- RAW PERMISSIONS EXTRACTOR SCRIPT (v3 - Enhanced Schema Vulnerability Check)
--- Purpose: To extract all relevant permission data in a simple, raw format
--- suitable for processing by an external tool (e.g., Python, Excel VBA).
--- Output is a series of pipe-delimited lines.
+-- RAW PERMISSIONS EXTRACTOR SCRIPT (v4 - GUI Friendly)
+-- Purpose: To extract all relevant permission data in a single result set.
+-- This version is compatible with GUI tools like pgAdmin and DBeaver.
+-- INSTRUCTIONS: Run this entire script in your GUI's query tool, then
+-- export the full result set to a CSV file (e.g., "raw_audit_data.csv").
 -- =============================================================================
-
--- Suppress informational messages and remove borders for clean output
-\t on
-\pset format unaligned
-\pset recordsep '\n'
-\pset fieldsep '|'
 
 -- PART 0: Role Metadata (Attributes and Memberships)
 -- This section outputs the fundamental properties of each role.
 SELECT
     'ROLE_METADATA' AS "type",
-    r.rolname AS "role_name",
-    r.rolcanlogin AS "can_login",
-    r.rolsuper AS "is_superuser",
-    r.rolcreaterole AS "can_create_role",
-    r.rolbypassrls AS "can_bypass_rls",
-    r.rolreplication AS "can_replicate",
-    (SELECT string_agg(parent.rolname, ',') FROM pg_auth_members am JOIN pg_roles parent ON am.roleid = parent.oid WHERE am.member = r.oid) AS "member_of"
-FROM pg_roles r;
+    r.rolname AS "data_1",
+    CAST(r.rolcanlogin AS TEXT) AS "data_2",
+    CAST(r.rolsuper AS TEXT) AS "data_3",
+    CAST(r.rolcreaterole AS TEXT) AS "data_4",
+    CAST(r.rolbypassrls AS TEXT) AS "data_5",
+    CAST(r.rolreplication AS TEXT) AS "data_6",
+    (SELECT string_agg(parent.rolname, ',') FROM pg_auth_members am JOIN pg_roles parent ON am.roleid = parent.oid WHERE am.member = r.oid) AS "data_7"
+FROM pg_roles r
 
--- PART 1 & 2: Database and Schema Privileges
--- This uses a recursive query to find all effective permissions, tracing them
--- back to their direct source grant.
-WITH RECURSIVE effective_privs AS (
-    -- Base case: Direct grants on DBs and Schemas
-    SELECT 'DATABASE' AS object_type, d.datname AS object_name, acl.privilege_type, r.rolname AS grantee_name, r.rolname AS source_role, r.oid AS grantee_oid
-    FROM pg_database d, LATERAL aclexplode(d.datacl) AS acl JOIN pg_roles r ON acl.grantee = r.oid WHERE d.datname = current_database()
-    UNION ALL
-    SELECT 'SCHEMA' AS object_type, n.nspname AS object_name, acl.privilege_type, r.rolname AS grantee_name, r.rolname AS source_role, r.oid AS grantee_oid
-    FROM pg_namespace n, LATERAL aclexplode(n.nspacl) AS acl JOIN pg_roles r ON acl.grantee = r.oid
-    UNION ALL
-    -- Recursive step: Inherited grants
-    SELECT ep.object_type, ep.object_name, ep.privilege_type, m_r.rolname AS grantee_name, ep.source_role, m_r.oid AS grantee_oid
-    FROM pg_auth_members m JOIN effective_privs ep ON m.roleid = ep.grantee_oid JOIN pg_roles m_r ON m.member = m_r.oid
+UNION ALL
+
+-- PART 1, 2 & 3: Database, Schema, and Table Privileges
+-- This uses recursive queries to find all effective permissions and their sources.
+(
+    WITH RECURSIVE effective_privs AS (
+        -- Base case: Direct grants on DBs, Schemas, and Tables
+        SELECT 'DATABASE' AS object_type, d.datname AS object_name, NULL::text AS schema_name, acl.privilege_type, r.rolname AS grantee_name, r.rolname AS source_role, r.oid AS grantee_oid
+        FROM pg_database d, LATERAL aclexplode(d.datacl) AS acl JOIN pg_roles r ON acl.grantee = r.oid WHERE d.datname = current_database()
+        UNION ALL
+        SELECT 'SCHEMA' AS object_type, n.nspname AS object_name, NULL::text AS schema_name, acl.privilege_type, r.rolname AS grantee_name, r.rolname AS source_role, r.oid AS grantee_oid
+        FROM pg_namespace n, LATERAL aclexplode(n.nspacl) AS acl JOIN pg_roles r ON acl.grantee = r.oid
+        UNION ALL
+        SELECT 'TABLE' AS object_type, c.relname AS object_name, n.nspname AS schema_name, acl.privilege_type, r.rolname AS grantee_name, r.rolname AS source_role, r.oid AS grantee_oid
+        FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid,
+        LATERAL aclexplode(COALESCE(c.relacl, acldefault('r', c.relowner))) AS acl
+        JOIN pg_roles r ON acl.grantee = r.oid
+        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'v', 'm')
+        UNION ALL
+        -- Recursive step: Inherited grants
+        SELECT ep.object_type, ep.object_name, ep.schema_name, ep.privilege_type, m_r.rolname AS grantee_name, ep.source_role, m_r.oid AS grantee_oid
+        FROM pg_auth_members m JOIN effective_privs ep ON m.roleid = ep.grantee_oid JOIN pg_roles m_r ON m.member = m_r.oid
+    )
+    SELECT
+        'PRIVILEGE' AS "type",
+        grantee_name AS "data_1",
+        object_type AS "data_2",
+        CASE
+            WHEN schema_name IS NOT NULL THEN schema_name || '.' || object_name
+            ELSE object_name
+        END AS "data_3",
+        privilege_type AS "data_4",
+        source_role AS "data_5",
+        NULL AS "data_6",
+        NULL AS "data_7"
+    FROM effective_privs
 )
-SELECT 'PRIVILEGE' AS "type", grantee_name, object_type, object_name, privilege_type, source_role
-FROM effective_privs;
 
+UNION ALL
 
--- PART 3: Table-Level Privileges
--- Similar recursive query, but for every table in every user schema.
-WITH RECURSIVE effective_privs AS (
-    -- Base case: Direct grants on tables
-    SELECT c.relname AS object_name, n.nspname as schema_name, acl.privilege_type, r.rolname AS grantee_name, r.rolname AS source_role, r.oid AS grantee_oid
-    FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid,
-    LATERAL aclexplode(COALESCE(c.relacl, acldefault('r', c.relowner))) AS acl
-    JOIN pg_roles r ON acl.grantee = r.oid
-    WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'v', 'm')
-    UNION ALL
-    -- Recursive step: Inherited grants
-    SELECT ep.object_name, ep.schema_name, ep.privilege_type, m_r.rolname AS grantee_name, ep.source_role, m_r.oid AS grantee_oid
-    FROM pg_auth_members m JOIN effective_privs ep ON m.roleid = ep.grantee_oid JOIN pg_roles m_r ON m.member = m_r.oid
-)
-SELECT 'PRIVILEGE' AS "type", grantee_name, 'TABLE' as object_type, schema_name || '.' || object_name, privilege_type, source_role
-FROM effective_privs;
-
-
--- =============================================================================
 -- FINAL AUDIT CHECKS
 -- These checks provide high-level context about the security posture.
--- =============================================================================
-
--- RLS Check: Is Row-Level Security used anywhere in this database?
-SELECT 'RLS_CHECK' AS "type", EXISTS(SELECT 1 FROM pg_class WHERE relrowsecurity = true) as "rls_is_enabled";
-
--- Default Privileges Check: Are there any default privileges set?
-SELECT 'DEFAULT_PRIVS_CHECK' AS "type", EXISTS(SELECT 1 FROM pg_default_acl) as "default_privs_exist";
-
--- Public Create Vulnerability Check: Lists all schemas where the PUBLIC role can create objects.
-SELECT 'PUBLIC_CREATE_VULN_SCHEMAS' AS "type", string_agg(nspname, ',') FROM pg_namespace WHERE has_schema_privilege('public', nspname, 'CREATE') AND nspname NOT LIKE 'pg_%' AND nspname <> 'information_schema';
-
--- Passwordless Login Check: Are there any roles that can log in but have no password set?
-SELECT 'NULL_PASS_CHECK' AS "type", EXISTS(SELECT 1 FROM pg_roles WHERE rolcanlogin = true AND rolpassword IS NULL) as "passwordless_login_exists";
-
--- pgcrypto Extension Check: Is the standard encryption extension available?
-SELECT 'PGCRYPTO_CHECK' AS "type", EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pgcrypto') as "pgcrypto_is_installed";
-
+SELECT 'RLS_CHECK', CAST(EXISTS(SELECT 1 FROM pg_class WHERE relrowsecurity = true) AS TEXT), NULL, NULL, NULL, NULL, NULL, NULL
+UNION ALL
+SELECT 'DEFAULT_PRIVS_CHECK', CAST(EXISTS(SELECT 1 FROM pg_default_acl) AS TEXT), NULL, NULL, NULL, NULL, NULL, NULL
+UNION ALL
+SELECT 'PUBLIC_CREATE_VULN_SCHEMAS', (SELECT string_agg(nspname, ',') FROM pg_namespace WHERE has_schema_privilege('public', nspname, 'CREATE') AND nspname NOT LIKE 'pg_%' AND nspname <> 'information_schema'), NULL, NULL, NULL, NULL, NULL, NULL
+UNION ALL
+SELECT 'NULL_PASS_CHECK', CAST(EXISTS(SELECT 1 FROM pg_roles WHERE rolcanlogin = true AND rolpassword IS NULL) AS TEXT), NULL, NULL, NULL, NULL, NULL, NULL
+UNION ALL
+SELECT 'PGCRYPTO_CHECK', CAST(EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pgcrypto') AS TEXT), NULL, NULL, NULL, NULL, NULL, NULL;
