@@ -1,0 +1,228 @@
+' =============================================================================
+' VBA MACRO TO IMPORT AND PROCESS POSTGRESQL AUDIT DATA (v2)
+' To install:
+' 1. In Excel, press ALT + F11 to open the VBA Editor.
+' 2. Go to Insert > Module.
+' 3. Copy and paste this entire script into the new module window.
+' 4. Close the VBA Editor.
+' 5. To run: Press ALT + F8, select "ProcessAuditReport", and click Run.
+'    (Or, create a button on the worksheet and assign this macro to it).
+' =============================================================================
+
+Option Explicit
+
+Sub ProcessAuditReport()
+    Dim wb As Workbook
+    Dim rawDataSheet As Worksheet, matrixSheet As Worksheet
+    Dim filePath As Variant
+    Dim fileNum As Integer
+    Dim lineFromFile As String
+    Dim data As Variant
+    
+    ' --- Dictionaries to hold our parsed data ---
+    Dim roleMetadata As Object ' Key: roleName, Value: another dictionary of metadata
+    Dim permissions As Object  ' Key: objectName, Value: dictionary (Key: roleName, Value: dictionary of perms)
+    Dim allRoles As Object, allObjects As Object
+    Dim finalChecks As Object
+    
+    ' --- Prompt user to select the raw data file ---
+    filePath = Application.GetOpenFilename("Data Files (*.txt; *.csv),*.txt;*.csv", , "Select Raw Audit Data File")
+    If filePath = False Then Exit Sub ' User cancelled
+    
+    ' --- Initialize objects ---
+    Set wb = ThisWorkbook
+    Set roleMetadata = CreateObject("Scripting.Dictionary")
+    Set permissions = CreateObject("Scripting.Dictionary")
+    Set allRoles = CreateObject("Scripting.Dictionary")
+    Set allObjects = CreateObject("Scripting.Dictionary")
+    Set finalChecks = CreateObject("Scripting.Dictionary")
+    
+    ' --- Read and parse the raw data file ---
+    fileNum = FreeFile()
+    Open filePath For Input As #fileNum
+    
+    On Error GoTo FileReadError
+    Do While Not EOF(fileNum)
+        Line Input #fileNum, lineFromFile
+        data = Split(lineFromFile, "|")
+        
+        If UBound(data) >= 1 Then
+            Dim dataType As String
+            dataType = data(0)
+            
+            Select Case True
+                Case dataType = "ROLE_METADATA"
+                    If Not roleMetadata.Exists(data(1)) Then
+                        Dim meta As Object
+                        Set meta = CreateObject("Scripting.Dictionary")
+                        meta("can_login") = IIf(data(2) = "t", "Yes", "No")
+                        meta("is_superuser") = IIf(data(3) = "t", "X", "")
+                        meta("can_create_role") = IIf(data(4) = "t", "X", "")
+                        meta("can_bypass_rls") = IIf(data(5) = "t", "X", "")
+                        meta("can_replicate") = IIf(data(6) = "t", "X", "")
+                        meta("member_of") = data(7)
+                        roleMetadata(data(1)) = meta
+                        allRoles(data(1)) = 1
+                    End If
+                
+                Case dataType = "PRIVILEGE"
+                    Dim grantee As String, objType As String, objName As String, priv As String
+                    grantee = data(1)
+                    objType = data(2)
+                    objName = data(3)
+                    priv = data(4)
+                    
+                    Dim fullObjName As String
+                    fullObjName = objType & ": " & objName
+                    
+                    allObjects(fullObjName) = 1
+                    allRoles(grantee) = 1
+                    
+                    If Not permissions.Exists(fullObjName) Then
+                        Set permissions(fullObjName) = CreateObject("Scripting.Dictionary")
+                    End If
+                    If Not permissions(fullObjName).Exists(grantee) Then
+                        Set permissions(fullObjName)(grantee) = CreateObject("Scripting.Dictionary")
+                    End If
+                    permissions(fullObjName)(grantee)(priv) = "X"
+
+                Case InStr(dataType, "_CHECK") > 0 Or InStr(dataType, "_VULN") > 0
+                    finalChecks(dataType) = data(1)
+            End Select
+        End If
+    Loop
+    Close #fileNum
+    On Error GoTo 0
+    
+    ' --- Prepare the Matrix Sheet ---
+    Application.ScreenUpdating = False
+    On Error Resume Next
+    wb.Sheets("Permission Matrix").Delete
+    On Error GoTo 0
+    Set matrixSheet = wb.Sheets.Add(After:=wb.Sheets(wb.Sheets.Count))
+    matrixSheet.Name = "Permission Matrix"
+    
+    ' --- Write the report ---
+    Dim sortedRoles As Variant
+    sortedRoles = SortDictionaryKeys(allRoles)
+    
+    ' --- Headers ---
+    matrixSheet.Cells(1, 1).Value = "Object Type"
+    matrixSheet.Cells(1, 2).Value = "Object Name"
+    matrixSheet.Cells(1, 3).Value = "Permission"
+    
+    Dim c As Integer
+    For c = 0 To UBound(sortedRoles)
+        matrixSheet.Cells(1, 4 + c).Value = sortedRoles(c)
+    Next c
+    
+    ' --- Metadata Rows ---
+    matrixSheet.Cells(2, 3).Value = "Can Login?"
+    matrixSheet.Cells(3, 3).Value = "Is Superuser?"
+    matrixSheet.Cells(4, 3).Value = "Can Create Role?"
+    matrixSheet.Cells(5, 3).Value = "Can Bypass RLS?"
+    matrixSheet.Cells(6, 3).Value = "Can Replicate?"
+    matrixSheet.Cells(7, 3).Value = "Member Of"
+    
+    For c = 0 To UBound(sortedRoles)
+        Dim currentRole As String
+        currentRole = sortedRoles(c)
+        If roleMetadata.Exists(currentRole) Then
+            matrixSheet.Cells(2, 4 + c).Value = roleMetadata(currentRole)("can_login")
+            matrixSheet.Cells(3, 4 + c).Value = roleMetadata(currentRole)("is_superuser")
+            matrixSheet.Cells(4, 4 + c).Value = roleMetadata(currentRole)("can_create_role")
+            matrixSheet.Cells(5, 4 + c).Value = roleMetadata(currentRole)("can_bypass_rls")
+            matrixSheet.Cells(6, 4 + c).Value = roleMetadata(currentRole)("can_replicate")
+            matrixSheet.Cells(7, 4 + c).Value = roleMetadata(currentRole)("member_of")
+        End If
+    Next c
+    
+    ' --- Main Permission Matrix ---
+    Dim sortedObjects As Variant
+    sortedObjects = SortDictionaryKeys(allObjects)
+    Dim r As Long
+    r = 9 ' Start data from row 9
+    
+    Dim i As Long, j As Long
+    For i = 0 To UBound(sortedObjects)
+        Dim currentObject As String, objParts As Variant
+        currentObject = sortedObjects(i)
+        objParts = Split(currentObject, ": ")
+        
+        matrixSheet.Cells(r, 1).Value = objParts(0) ' Object Type
+        matrixSheet.Cells(r, 2).Value = objParts(1) ' Object Name
+        
+        Dim allPerms As Object
+        Set allPerms = CreateObject("Scripting.Dictionary")
+        
+        If permissions.Exists(currentObject) Then
+            Dim roleKey As Variant
+            For Each roleKey In permissions(currentObject).Keys
+                Dim permKey As Variant
+                For Each permKey In permissions(currentObject)(roleKey).Keys
+                    allPerms(permKey) = 1
+                Next permKey
+            Next roleKey
+        End If
+        
+        Dim sortedPerms As Variant
+        If allPerms.Count > 0 Then
+            sortedPerms = SortDictionaryKeys(allPerms)
+            
+            For j = 0 To UBound(sortedPerms)
+                matrixSheet.Cells(r + j, 3).Value = sortedPerms(j)
+                ' Fill in the X's
+                For c = 0 To UBound(sortedRoles)
+                    If permissions.Exists(currentObject) Then
+                        If permissions(currentObject).Exists(sortedRoles(c)) Then
+                            If permissions(currentObject)(sortedRoles(c)).Exists(sortedPerms(j)) Then
+                                matrixSheet.Cells(r + j, 4 + c).Value = "X"
+                            End If
+                        End If
+                    End If
+                Next c
+            Next j
+            r = r + j + 1 ' Move to the next block of rows
+        Else
+            r = r + 1 ' Move down one row even if no permissions
+        End If
+    Next i
+
+    ' --- Final Touches ---
+    r = r + 2 ' Add some space before the final checks
+    matrixSheet.Cells(r, 1).Value = "Final Audit Checks"
+    matrixSheet.Cells(r, 1).Font.Bold = True
+    r = r + 1
+    
+    Dim checkKey As Variant
+    For Each checkKey In finalChecks.Keys
+        matrixSheet.Cells(r, 1).Value = checkKey
+        matrixSheet.Cells(r, 2).Value = finalChecks(checkKey)
+        r = r + 1
+    Next checkKey
+    
+    matrixSheet.Columns.AutoFit
+    matrixSheet.Cells(1, 1).Select
+    Application.ScreenUpdating = True
+    MsgBox "Audit report has been successfully generated.", vbInformation
+
+    Exit Sub
+
+FileReadError:
+    MsgBox "An error occurred while reading the file. Please ensure it's a valid text file or CSV.", vbCritical
+    If fileNum > 0 Then Close #fileNum
+End Sub
+
+Private Function SortDictionaryKeys(dict As Object) As Variant
+    ' Helper function to sort dictionary keys for consistent output
+    Dim arr As Object
+    Set arr = CreateObject("System.Collections.ArrayList")
+    
+    Dim key As Variant
+    For Each key In dict.Keys
+        arr.Add key
+    Next key
+    arr.Sort
+    SortDictionaryKeys = arr.ToArray()
+End Function
+
