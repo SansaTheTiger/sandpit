@@ -1,12 +1,13 @@
 ' =============================================================================
-' VBA MACRO TO IMPORT AND PROCESS POSTGRESQL AUDIT DATA (v2)
+' VBA MACRO TO IMPORT AND PROCESS POSTGRESQL AUDIT DATA (v3 - ROBUST PARSING)
+' This version is more resilient and will strip out any double quotes ("")
+' found in the input file, which is a common issue with GUI exports.
 ' To install:
 ' 1. In Excel, press ALT + F11 to open the VBA Editor.
 ' 2. Go to Insert > Module.
 ' 3. Copy and paste this entire script into the new module window.
 ' 4. Close the VBA Editor.
 ' 5. To run: Press ALT + F8, select "ProcessAuditReport", and click Run.
-'    (Or, create a button on the worksheet and assign this macro to it).
 ' =============================================================================
 
 Option Explicit
@@ -20,8 +21,8 @@ Sub ProcessAuditReport()
     Dim data As Variant
     
     ' --- Dictionaries to hold our parsed data ---
-    Dim roleMetadata As Object ' Key: roleName, Value: another dictionary of metadata
-    Dim permissions As Object  ' Key: objectName, Value: dictionary (Key: roleName, Value: dictionary of perms)
+    Dim roleMetadata As Object
+    Dim permissions As Object
     Dim allRoles As Object, allObjects As Object
     Dim finalChecks As Object
     
@@ -44,6 +45,10 @@ Sub ProcessAuditReport()
     On Error GoTo FileReadError
     Do While Not EOF(fileNum)
         Line Input #fileNum, lineFromFile
+        
+        ' *** KEY CHANGE IS HERE: Strip all double quotes from the line before splitting ***
+        lineFromFile = Replace(lineFromFile, """", "")
+        
         data = Split(lineFromFile, "|")
         
         If UBound(data) >= 1 Then
@@ -55,12 +60,12 @@ Sub ProcessAuditReport()
                     If Not roleMetadata.Exists(data(1)) Then
                         Dim meta As Object
                         Set meta = CreateObject("Scripting.Dictionary")
-                        meta("can_login") = IIf(data(2) = "t", "Yes", "No")
-                        meta("is_superuser") = IIf(data(3) = "t", "X", "")
-                        meta("can_create_role") = IIf(data(4) = "t", "X", "")
-                        meta("can_bypass_rls") = IIf(data(5) = "t", "X", "")
-                        meta("can_replicate") = IIf(data(6) = "t", "X", "")
-                        meta("member_of") = data(7)
+                        meta("can_login") = IIf(LCase(data(2)) = "t", "Yes", "No")
+                        meta("is_superuser") = IIf(LCase(data(3)) = "t", "X", "")
+                        meta("can_create_role") = IIf(LCase(data(4)) = "t", "X", "")
+                        meta("can_bypass_rls") = IIf(LCase(data(5)) = "t", "X", "")
+                        meta("can_replicate") = IIf(LCase(data(6)) = "t", "X", "")
+                        meta("member_of") = IIf(UBound(data) >= 7, data(7), "")
                         roleMetadata(data(1)) = meta
                         allRoles(data(1)) = 1
                     End If
@@ -97,12 +102,21 @@ Sub ProcessAuditReport()
     ' --- Prepare the Matrix Sheet ---
     Application.ScreenUpdating = False
     On Error Resume Next
+    Application.DisplayAlerts = False
     wb.Sheets("Permission Matrix").Delete
+    Application.DisplayAlerts = True
     On Error GoTo 0
     Set matrixSheet = wb.Sheets.Add(After:=wb.Sheets(wb.Sheets.Count))
     matrixSheet.Name = "Permission Matrix"
     
     ' --- Write the report ---
+    If allRoles.Count = 0 Then
+        matrixSheet.Cells(1, 1).Value = "Error: No data could be parsed from the input file. Please verify the file format and delimiter."
+        Application.ScreenUpdating = True
+        MsgBox "Could not parse any data from the selected file. Please check the file's content and format.", vbCritical
+        Exit Sub
+    End If
+    
     Dim sortedRoles As Variant
     sortedRoles = SortDictionaryKeys(allRoles)
     
@@ -225,4 +239,3 @@ Private Function SortDictionaryKeys(dict As Object) As Variant
     arr.Sort
     SortDictionaryKeys = arr.ToArray()
 End Function
-
