@@ -1,0 +1,34 @@
+$HostName = "internal.app.com"
+$Port = 443
+
+# Load the required assemblies
+Add-Type -AssemblyName System.Net.Http
+
+# Create an HttpClient instance
+$HttpClient = [System.Net.Http.HttpClient]::new()
+
+try {
+    # Send a HEAD request (minimal data transfer)
+    $Request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Head, "https://$HostName")
+    
+    # Force the connection using all modern protocols for the first test
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+
+    # Send the request and get the response
+    $Response = $HttpClient.SendAsync($Request).Result
+    
+    # Access the transport properties of the underlying connection
+    $Connection = $Response.RequestMessage.Properties.Item('SslConnectionProperties')
+    
+    # Output the negotiated protocol
+    Write-Host "Connection Successful."
+    Write-Host "Negotiated TLS Version: $($Connection.ProtocolVersion)"
+    
+}
+catch {
+    Write-Host "Connection Failed: $($_.Exception.Message)"
+}
+finally {
+    # Dispose of the client
+    $HttpClient.Dispose()
+}
